@@ -1,0 +1,144 @@
+================================================================================
+  CarpetSegNet v2 — D435 地毯分割模型部署使用流程
+  目标设备：Jetson Orin Nano (JetPack 6.x / Ubuntu 22.04)
+================================================================================
+
+【1. 环境准备】
+
+将整个 deploy/ 文件夹拷贝到 Jetson 设备上。
+
+Jetson Orin Nano 的 JetPack 已预装 PyTorch 和 torchvision，
+只需安装额外依赖：
+
+    cd deploy/
+    pip install -r requirements.txt
+
+如需 ONNX 推理（可选）：
+
+    pip install onnxruntime-gpu
+
+
+【2. PyTorch 直接推理（最简单）】
+
+单张图片：
+    python infer.py --rgb 测试图.png --depth 深度图.png --out 结果.png
+
+批量处理：
+    python infer.py \
+        --rgb-dir ./test_rgb/ \
+        --depth-dir ./test_depth/ \
+        --out-dir ./pred_masks/ \
+        --vis-dir ./vis_overlay/
+
+测速：
+    python infer.py --rgb 测试图.png --depth 深度图.png --benchmark
+
+CPU模式（无GPU时）：
+    python infer.py --rgb 测试图.png --depth 深度图.png --out 结果.png --device cpu
+
+
+【3. 导出 ONNX 模型（在工作站或 Jetson 上执行）】
+
+FP32 导出：
+    python export_onnx.py --output model.onnx --simplify
+
+FP16 导出（文件更小）：
+    python export_onnx.py --output model_fp16.onnx --half --simplify
+
+导出 TorchScript（备选方案）：
+    python export_onnx.py --torchscript --output model_script.pt
+
+
+【4. ONNX → TensorRT 引擎转换（在 Jetson 上执行）】
+
+    # FP16 TensorRT 引擎（推荐，推理速度最快）
+    /usr/src/tensorrt/bin/trtexec \
+        --onnx=model.onnx \
+        --saveEngine=model.trt \
+        --fp16
+
+    # 使用 ONNX Runtime 加载 ONNX 模型推理
+    python infer.py --onnx model.onnx \
+        --rgb 测试图.png --depth 深度图.png --out 结果.png
+
+
+【4b. D435 实时推理】
+
+    连接 D435 相机后，直接运行实时分割：
+
+    # 实时显示 (默认 640x480@30fps)
+    python realtime_infer.py
+
+    # 同步录制结果
+    python realtime_infer.py --record ./recorded/
+
+    # 降低分辨率提升帧率
+    python realtime_infer.py --resolution 640 480 --fps 30
+
+    # 使用 ONNX 后端加速
+    python realtime_infer.py --onnx model.onnx
+
+    # 无头模式 (无显示器)
+    python realtime_infer.py --no-display --record ./output/
+
+    实时窗口控制：
+      'q' — 退出
+      's' — 保存当前帧 (可通过 --save-trigger <key> 自定义)
+
+
+【5. 输入数据要求】
+
+RGB 图片：  普通 PNG/JPG，480×640 或任意分辨率（会自动 resize）
+深度图片：  16-bit PNG，单位为毫米（mm），与 RGB 同分辨率
+
+深度图从 D435 相机获取后转换示例：
+    depth_meters = ...  # D435 返回的深度，单位米
+    depth_mm = (depth_meters * 1000).astype(np.uint16)
+    cv2.imwrite("深度图.png", depth_mm)
+
+
+【6. 输出说明】
+
+推理输出：
+  - 二值掩码 PNG：255=地毯区域，0=背景
+  - 使用 --prob 参数可输出概率图（0~1 浮点值）
+  - 使用 --vis-dir 参数可输出叠加可视化图
+
+
+【7. 模型信息】
+
+  架构：      ResNet50 + U-Net Decoder + RefinementHead
+  输入通道：  9ch（RGB×3 + Depth×1 + Normal×3 + Edge×1 + Curvature×1）
+  参数量：    ~28.2M
+  最佳 mIoU： 0.8272
+  IoU(carpet)：0.6590
+  训练日期：  2026-08-07
+  权重文件：  weights/best_fp16.pth（FP16 半精度，54MB）
+
+
+【8. 性能参考（Jetson Orin Nano）】
+
+  模式                 延迟/帧      备注
+  ─────────────────────────────────────────
+  PyTorch FP32        ~15-25 ms   直接可用
+  PyTorch AMP FP16    ~10-15 ms   默认开启
+  ONNX Runtime CUDA   ~8-12 ms    需安装 onnxruntime-gpu
+  TensorRT FP16       ~5-8 ms     需先转 TensorRT 引擎
+
+
+【9. 常见问题】
+
+Q: 报错 "No module named 'torch'"
+A: Jetson 上 PyTorch 随 JetPack 预装在系统 Python 中，
+   确认使用系统 Python 而不是 conda/venv。
+
+Q: 深度图加载后全是0
+A: 确认深度图为 16-bit PNG，值以毫米为单位。
+   如果是浮点格式(.npy/.tiff)，需修改 infer.py 中的 load_depth_png 函数。
+
+Q: ONNX 导出时报错
+A: 确保已安装 onnx 包：pip install onnx onnxsim
+
+Q: 输出掩码全是背景（全黑）
+A: 检查深度图是否正确加载，几何特征是否计算正常。
+   可先在同一张图上用 PyTorch 模式测试，确认模型本身工作正常。
