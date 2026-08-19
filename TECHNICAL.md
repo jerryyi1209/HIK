@@ -383,3 +383,53 @@ Current best:                                       0.8272  (+5.7pp from baselin
 3. **Small original dataset:** 175 positive frames is the fundamental ceiling. More original NYU annotations or domain-specific data collection would help.
 4. **Validation oscillation:** ±3pp mIoU swing (0.75-0.82) suggests the loss landscape is flat with many local minima. SWA couldn't help due to fixed offline data.
 5. **No test-time evaluation of best model:** Test set metrics would provide better estimate of real-world generalization.
+
+---
+
+## 8. Evolution: Original v1 (CarpetSegNet) → v2 (SimpleModel)
+
+The earliest network (`CarpetSegNet`, preserved in `models/model.py`) was designed around **sparse dToF depth + dual-backbone gated fusion**. It was rewritten as `SimpleModel` after hitting three walls: NaN instability, sparse-depth limitations, and the SUN/NYU labeling-paradigm conflict. This section documents the before/after and the improvements that produced the +6.7pp mIoU gain.
+
+### 8.1 Architecture Comparison
+
+| Dimension | v1 (CarpetSegNet) | v2 (SimpleModel) |
+|---|---|---|
+| **Input** | RGB(3) + LingBot-completed depth(1) → encoder; sparse dToF conf(1) → fusion gate | RGB(3) + dense D435 depth(1) + normals(3) + edge(1) + curvature(1) = 9ch |
+| **Encoder** | SharedEncoder (ResNet34), fp32 | Single ResNet50, RGB+depth concat at input |
+| **Fusion** | `DtoFGatedFusion`: SE-gate per scale, `feat × (1 + spatial_gate · channel_gate)` | None — cross-modal features from layer 1 |
+| **Decoder** | Deep-supervised FPN: side connections + 3 aux heads (f2/f3/f4) | U-Net skip connections + single RefinementHead |
+| **Loss** | Focal + Tversky/Dice + Lovász-Softmax + depth-consistency | CE (class/edge-weighted, label smoothing) + Dice + Focal |
+| **Regularization** | Modality dropout (zero-out RGB or depth) | Label smoothing + stronger weight decay |
+| **Training** | Two-phase progressive loss transition | Single-phase, standard AMP |
+| **Numerical stability** | NaN-prone → `clamp`/`nan_to_num` hacks at every stage | AMP-safe by construction — no NaN hacks |
+| **Best mIoU** | **0.7599** (IoU-carpet 0.5267) | **0.8272** (IoU-carpet 0.6590) |
+
+### 8.2 Why v1 was rewritten
+
+**1. NaN instability.** The v1 training log (`experiments/carpet_seg_dtof_default/logs/train.log`) shows the model converged to mIoU 0.7599 by epoch 8, then the next run collapsed to `Loss: nan` for the entire epoch. Three independent NaN sources:
+
+- **FP16 BatchNorm variance underflow** — the ResNet34 BasicBlock residual path in fp16, where BN variance underflow → divide-by-zero → Inf → NaN ([models/model.py:14](models/model.py#L14)).
+- **Multiplicative gate amplification** — `DtoFGatedFusion` computes `feat × (1 + spatial_gate · channel_gate)`; once BN weights are polluted by an Inf gradient, the gate emits NaN and multiplies it through every channel ([models/fusion.py:79](models/fusion.py#L79)).
+- **FPN accumulation + deep supervision** — side-connection summing and multiple aux heads overflow logits ([models/model.py:16](models/model.py#L16)).
+
+The "fixes" were reactive band-aids: per-stage `torch.clamp(±100)`, `nan_to_num` in fusion, a `CARPETSEG_DEBUG` NaN diagnostic, forced fp32 on the encoder/decoder, and a train-loop "skip NaN batch" guard. None removed the root cause.
+
+**2. Sparse dToF limits geometry.** dToF covers only ~30% of pixels, so its gradients are unreliable and surface normals/curvature can't be computed. The v1 architecture worked around this by completing depth with LingBot, but the completed depth had its own artifacts and the dToF gate only emphasized (not fixed) the sparse signal.
+
+**3. Complexity without benefit.** The dual-backbone + gated-fusion + deep-supervision design was motivated by "fuse modalities more explicitly," but empirically it did not beat a simpler single-encoder baseline — while carrying a much higher NaN surface area.
+
+### 8.3 Improvements and Their Impact
+
+| Improvement | Change | Effect |
+|---|---|---|
+| **Sparse dToF → dense depth** | Drop dToF + LingBot; use D435 dense depth directly | Enables geometric features (the core dense-depth advantage) |
+| **Dual backbone + gate → single shared encoder** | RGB+depth concatenated at input; delete fusion gate | Removes the multiplicative NaN path; cross-modal from layer 1 |
+| **FPN deep supervision → U-Net skips** | One decoder, lateral skip connections, no aux heads | Removes FPN accumulation / logit overflow |
+| **5-component loss → 3-component** | Drop Lovász-Softmax and depth-consistency | Lovász was AMP-incompatible; simpler loss is numerically stable |
+| **Geometric features (4ch→9ch)** | +normals(3)+edge(1)+curvature(1) | **+2.0pp** (largest single gain) |
+| **TTA validation** | 3 scales × 2 flips | +0.3pp |
+| **Depth noise + dropout** | multiplicative σ=0.005, 10% hole dropout | +0.2pp |
+| **Label smoothing (0.1)** | target `[0.05, 0.95]` | +1.5pp (anti-overfitting) |
+| **Weight decay (1e-4→5e-4)** | stronger L2 | +1.1pp (synergistic with LS) |
+
+**Net:** 0.7599 → 0.8272 mIoU (**+6.7pp**), with a numerically stable, AMP-safe architecture that requires none of v1's clamp/nan_to_num hacks. The geometric-feature gain was the largest single step (inherent to dense depth); the anti-overfitting measures (label smoothing + weight decay) were the largest *combined* step despite adding no new information — confirming overfitting, not information scarcity, was the dominant v2 bottleneck.
